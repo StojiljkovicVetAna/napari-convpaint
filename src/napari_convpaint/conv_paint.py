@@ -2,6 +2,8 @@ from qtpy.QtWidgets import (QWidget, QPushButton,QVBoxLayout,
                             QLabel, QComboBox,QFileDialog, QListWidget,
                             QCheckBox, QAbstractItemView, QGridLayout, QSpinBox)
 from qtpy.QtCore import Qt
+from magicgui.widgets import create_widget
+import napari
 from joblib import dump, load
 from pathlib import Path
 import warnings
@@ -27,11 +29,11 @@ class ConvPaintWidget(QWidget):
     ----------
     napari_viewer: napari.Viewer
         main napari viwer
-    channel: str
-        layer name to use for features extraction/classification
+    project: bool
+        use project widget for multi-image project management
     """
     
-    def __init__(self, napari_viewer, channel=None, parent=None, project=False):
+    def __init__(self, napari_viewer, parent=None, project=False):
         super().__init__(parent=parent)
         self.viewer = napari_viewer
         
@@ -51,9 +53,13 @@ class ConvPaintWidget(QWidget):
         self.main_layout.addWidget(self.tabs)
 
         self.tabs.widget(0).layout().setAlignment(Qt.AlignTop)
-        self.select_layer_widget = QComboBox()
-        self.select_layer_widget.addItems([x.name for x in self.viewer.layers])
-        self.tabs.add_named_tab('Annotation', self.select_layer_widget, grid_pos=[0,0,1,2])
+        self.select_layer_widget = create_widget(annotation=napari.layers.Image, label='Pick image')
+        self.select_layer_widget.reset_choices()
+        self.viewer.layers.events.inserted.connect(self.select_layer_widget.reset_choices)
+        self.viewer.layers.events.removed.connect(self.select_layer_widget.reset_choices)
+        #self.select_layer_widget = QComboBox()
+        #self.select_layer_widget.addItems([x.name for x in self.viewer.layers])
+        self.tabs.add_named_tab('Annotation', self.select_layer_widget.native, grid_pos=[0,0,1,2])
 
         self.add_layers_btn = QPushButton('Add annotation/predict layers')
         self.tabs.add_named_tab('Annotation', self.add_layers_btn, grid_pos=[1,0,1,2])
@@ -78,13 +84,9 @@ class ConvPaintWidget(QWidget):
         self.load_model_btn = QPushButton('Load trained model')
         self.tabs.add_named_tab('Annotation', self.load_model_btn, grid_pos=[4,1,1,1])
 
-        self.check_use_project = QCheckBox('Use project')
+        self.check_use_project = QCheckBox('Use multiple files')
         self.check_use_project.setChecked(False)
         self.tabs.add_named_tab('Annotation', self.check_use_project, grid_pos=[5,0,1,1])
-
-        self.check_use_cuda = QCheckBox('Use cuda')
-        self.check_use_cuda.setChecked(False)
-        self.tabs.add_named_tab('Annotation', self.check_use_cuda, grid_pos=[5,1,1,1])
 
         self.check_use_default_model = QCheckBox('Use default model')
         self.check_use_default_model.setChecked(True)
@@ -93,18 +95,19 @@ class ConvPaintWidget(QWidget):
         self.check_dims_is_channels = QCheckBox('Multichannel image')
         self.check_dims_is_channels.setChecked(False)
         self.check_dims_is_channels.setToolTip('If checked, the additional dimensions is not treated as time-lapse but as channels.')
-        self.tabs.add_named_tab('Annotation', self.check_dims_is_channels, grid_pos=[6,1,1,1])
+        self.tabs.add_named_tab('Annotation', self.check_dims_is_channels, grid_pos=[7,0,1,1])
 
         self.spin_downsample = QSpinBox()
         self.spin_downsample.setMinimum(1)
         self.spin_downsample.setMaximum(10)
         self.spin_downsample.setValue(1)
-        self.tabs.add_named_tab('Annotation', QLabel('Downsample'), grid_pos=[7,0,1,1])
-        self.tabs.add_named_tab('Annotation', self.spin_downsample, grid_pos=[7,1,1,1])
+        self.spin_downsample.setToolTip('Reduce image size for faster computing.')
+        self.tabs.add_named_tab('Annotation', QLabel('Downsample'), grid_pos=[8,0,1,1])
+        self.tabs.add_named_tab('Annotation', self.spin_downsample, grid_pos=[8,1,1,1])
 
         self.qcombo_model_type = QComboBox()
         self.qcombo_model_type.addItems([
-            'vgg16', 'efficient_netb0', 'single_layer_vgg16', 'single_layer_vgg16_rgb', 'dino_vits16'])
+            'vgg16', 'efficient_netb0', 'single_layer_vgg16', 'single_layer_vgg16_rgb'])
         self.tabs.add_named_tab('Model', self.qcombo_model_type, [0,0,1,2])
 
         self.load_nnmodel_btn = QPushButton('Load nn model')
@@ -137,7 +140,11 @@ class ConvPaintWidget(QWidget):
 
         self.check_normalize = QCheckBox('Normalize')
         self.check_normalize.setChecked(True)
-        self.tabs.add_named_tab('Model', self.check_normalize, [7,0,1,2])
+        self.tabs.add_named_tab('Model', self.check_normalize, [7,0,1,1])
+
+        self.check_use_cuda = QCheckBox('Use cuda')
+        self.check_use_cuda.setChecked(False)
+        self.tabs.add_named_tab('Model', self.check_use_cuda, grid_pos=[7,1,1,1])
 
 
         if project is True:
@@ -178,11 +185,10 @@ class ConvPaintWidget(QWidget):
 
 
     def add_connections(self):
-
-        self.select_layer_widget.currentIndexChanged.connect(self.select_layer)
+        
+        self.select_layer_widget.changed.connect(self.select_layer)
+        self.viewer.layers.events.removed.connect(self.reset_model)
         self.num_scales_combo.currentIndexChanged.connect(self.update_scalings)
-        self.viewer.layers.events.removed.connect(self.update_layer_list)
-        self.viewer.layers.events.inserted.connect(self.update_layer_list)
 
         self.add_layers_btn.clicked.connect(self.add_annotation_layer)
         self.update_model_btn.clicked.connect(self.update_classifier)
@@ -197,7 +203,7 @@ class ConvPaintWidget(QWidget):
         self.load_nnmodel_btn.clicked.connect(self._on_load_nnmodel)
         self.set_nnmodel_outputs_btn.clicked.connect(self._on_click_define_model_outputs)
 
-    def update_layer_list(self, event):
+    '''def update_layer_list(self, event):
         
         keep_channel = None
         if self.selected_channel is not None:
@@ -208,11 +214,16 @@ class ConvPaintWidget(QWidget):
             self.select_layer_widget.setCurrentText(keep_channel)
         else:
             if self.viewer.layers:
-                self.select_layer_widget.setCurrentText(self.viewer.layers[0].name)
+                self.select_layer_widget.setCurrentText(self.viewer.layers[0].name)'''
 
-    def select_layer(self):
+    def select_layer(self, newtext=None):
+        
+        self.selected_channel = self.select_layer_widget.native.currentText()        
 
-        self.selected_channel = self.select_layer_widget.currentText()
+    def reset_model(self, event=None):
+
+        if len(self.viewer.layers) == 0:
+            self.model = None
 
     def add_annotation_layer(self):
         """Add annotation and prediction layers to viewer."""
@@ -232,6 +243,7 @@ class ConvPaintWidget(QWidget):
             data=np.zeros((layer_shape), dtype=np.uint8),
             name='prediction'
             )
+        self.viewer.layers.selection.active = self.viewer.layers['annotations']
 
     def update_scalings(self):
 
@@ -463,12 +475,15 @@ class ConvPaintWidget(QWidget):
                 name='prediction'
             )
 
-    def save_model(self):
+    def save_model(self, event=None, save_file=None):
         """Select file where to save the classifier model."""
 
+        if self.random_forest is None:
+            raise Exception('No model found. Please train a model first.')
         # save sklearn model
-        dialog = QFileDialog()
-        save_file, _ = dialog.getSaveFileName(self, "Save model", None, "JOBLIB (*.joblib)")
+        if save_file is None:
+            dialog = QFileDialog()
+            save_file, _ = dialog.getSaveFileName(self, "Save model", None, "JOBLIB (*.joblib)")
         save_file = Path(save_file)
         dump(self.random_forest, save_file)
         self.param.random_forest = save_file#.as_posix()

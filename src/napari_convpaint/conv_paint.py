@@ -4,6 +4,7 @@ from qtpy.QtWidgets import (QWidget, QPushButton,QVBoxLayout,
 from qtpy.QtCore import Qt
 from magicgui.widgets import create_widget
 import napari
+from napari.utils import progress
 from joblib import dump, load
 from pathlib import Path
 import warnings
@@ -88,9 +89,9 @@ class ConvPaintWidget(QWidget):
         self.check_use_project.setChecked(False)
         self.tabs.add_named_tab('Annotation', self.check_use_project, grid_pos=[5,0,1,1])
 
-        self.check_use_default_model = QCheckBox('Use default model')
-        self.check_use_default_model.setChecked(True)
-        self.tabs.add_named_tab('Annotation', self.check_use_default_model, grid_pos=[6,0,1,1])
+        self.check_use_custom_model = QCheckBox('Use custom model')
+        self.check_use_custom_model.setChecked(False)
+        self.tabs.add_named_tab('Annotation', self.check_use_custom_model, grid_pos=[6,0,1,1])
 
         self.check_dims_is_channels = QCheckBox('Multichannel image')
         self.check_dims_is_channels.setChecked(False)
@@ -153,6 +154,9 @@ class ConvPaintWidget(QWidget):
         self.add_connections()
         self.select_layer()
 
+        self.viewer.bind_key('a', self.hide_annotation)
+        self.viewer.bind_key('r', self.hide_prediction)
+
     def _add_project(self, event=None):
         """Add widget for multi-image project management"""
 
@@ -177,7 +181,7 @@ class ConvPaintWidget(QWidget):
     def _set_custom_model(self, event=None):
         """Add widget for custom model management"""
 
-        if self.check_use_default_model.isChecked():
+        if not self.check_use_custom_model.isChecked():
             self.tabs.setTabEnabled(self.tabs.tab_names.index('Model'), False)
             self.set_default_model()
         else:
@@ -198,7 +202,7 @@ class ConvPaintWidget(QWidget):
         self.save_model_btn.clicked.connect(self.save_model)
         self.load_model_btn.clicked.connect(self.load_classifier)
         self.check_use_project.stateChanged.connect(self._add_project)
-        self.check_use_default_model.stateChanged.connect(self._set_custom_model)
+        self.check_use_custom_model.stateChanged.connect(self._set_custom_model)
 
         self.load_nnmodel_btn.clicked.connect(self._on_load_nnmodel)
         self.set_nnmodel_outputs_btn.clicked.connect(self._on_click_define_model_outputs)
@@ -215,6 +219,22 @@ class ConvPaintWidget(QWidget):
         else:
             if self.viewer.layers:
                 self.select_layer_widget.setCurrentText(self.viewer.layers[0].name)'''
+
+    def hide_annotation(self, event=None):
+        """Hide annotation layer."""
+
+        if self.viewer.layers['annotations'].visible == False:
+            self.viewer.layers['annotations'].visible = True
+        else:
+            self.viewer.layers['annotations'].visible = False
+
+    def hide_prediction(self, event=None):
+        """Hide prediction layer."""
+
+        if self.viewer.layers['prediction'].visible == False:
+            self.viewer.layers['prediction'].visible = True
+        else:
+            self.viewer.layers['prediction'].visible = False
 
     def select_layer(self, newtext=None):
         
@@ -306,7 +326,7 @@ class ConvPaintWidget(QWidget):
             raise Exception('You need annoations for foreground and background')
         
         if self.model is None:
-            if self.check_use_default_model.isChecked():
+            if not self.check_use_custom_model.isChecked():
                 
                 # use 2d input for 2d images or if 3d input does not represent channels
                 # use 3d input for rgb or if 3d input is channels and has dims 3
@@ -331,41 +351,10 @@ class ConvPaintWidget(QWidget):
         data_to_pass = self.viewer.layers[self.selected_channel].data
         if self.viewer.layers[self.selected_channel].rgb:
             data_to_pass = np.moveaxis(data_to_pass, 2, 0)
-        features, targets = get_features_current_layers(
-            model=self.model,
-            image=data_to_pass,
-            annotations=self.viewer.layers['annotations'].data,
-            scalings=self.param.scalings,
-            order=self.spin_interpolation_order.value(),
-            use_min_features=self.check_use_min_features.isChecked(),
-            device=device,
-            normalize=self.check_normalize.isChecked(),
-            image_downsample=self.spin_downsample.value()
-        )
-        self.random_forest = train_classifier(features, targets)
-
-    def update_classifier_on_project(self):
-        """Train classifier on all annotations in project."""
-
-        if self.model is None:
-            if self.check_use_default_model.isChecked():
-                self.set_default_model()
-            else:
-                raise Exception('You have to define and load a model first')
-        device = 'cuda' if self.check_use_cuda.isChecked() else 'cpu'
-
-        num_files = len(self.project_widget.params.file_paths)
-        if num_files == 0:
-            raise Exception('No files found')
         
-        all_features, all_targets = [], []
-        for ind in range(num_files):
-            self.project_widget.file_list.setCurrentRow(ind)
-
-            data_to_pass = self.viewer.layers[self.selected_channel].data
-            if self.viewer.layers[self.selected_channel].rgb:
-                data_to_pass = np.moveaxis(data_to_pass, 2, 0)
-
+        self.viewer.window._status_bar._toggle_activity_dock(True)
+        with progress(total=0) as pbr:
+            pbr.set_description(f"Training")
             features, targets = get_features_current_layers(
                 model=self.model,
                 image=data_to_pass,
@@ -377,15 +366,57 @@ class ConvPaintWidget(QWidget):
                 normalize=self.check_normalize.isChecked(),
                 image_downsample=self.spin_downsample.value()
             )
-            if features is None:
-                continue
-            all_features.append(features)
-            all_targets.append(targets)
-        
-        all_features = np.concatenate(all_features, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
+            self.random_forest = train_classifier(features, targets)
+        self.viewer.window._status_bar._toggle_activity_dock(False)
 
-        self.random_forest = train_classifier(all_features, all_targets)
+    def update_classifier_on_project(self):
+        """Train classifier on all annotations in project."""
+
+        if self.model is None:
+            if not self.check_use_custom_model.isChecked():
+                self.set_default_model()
+            else:
+                raise Exception('You have to define and load a model first')
+        device = 'cuda' if self.check_use_cuda.isChecked() else 'cpu'
+
+        num_files = len(self.project_widget.params.file_paths)
+        if num_files == 0:
+            raise Exception('No files found')
+        
+        self.viewer.window._status_bar._toggle_activity_dock(True)
+        self.viewer.layers.events.removed.disconnect(self.reset_model)
+        with progress(total=0) as pbr:
+            pbr.set_description(f"Training")
+            all_features, all_targets = [], []
+            for ind in range(num_files):
+                self.project_widget.file_list.setCurrentRow(ind)
+
+                data_to_pass = self.viewer.layers[self.selected_channel].data
+                if self.viewer.layers[self.selected_channel].rgb:
+                    data_to_pass = np.moveaxis(data_to_pass, 2, 0)
+
+                features, targets = get_features_current_layers(
+                    model=self.model,
+                    image=data_to_pass,
+                    annotations=self.viewer.layers['annotations'].data,
+                    scalings=self.param.scalings,
+                    order=self.spin_interpolation_order.value(),
+                    use_min_features=self.check_use_min_features.isChecked(),
+                    device=device,
+                    normalize=self.check_normalize.isChecked(),
+                    image_downsample=self.spin_downsample.value()
+                )
+                if features is None:
+                    continue
+                all_features.append(features)
+                all_targets.append(targets)
+            
+            all_features = np.concatenate(all_features, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+
+            self.random_forest = train_classifier(all_features, all_targets)
+        self.viewer.window._status_bar._toggle_activity_dock(False)
+        self.viewer.layers.events.removed.connect(self.reset_model)
         
 
     def predict(self):
@@ -393,7 +424,7 @@ class ConvPaintWidget(QWidget):
         on a RF model trained with annotations"""
 
         if self.model is None:
-            if self.check_use_default_model.isChecked():
+            if not self.check_use_custom_model.isChecked():
                 self.set_default_model()
             else:
                 raise Exception('You have to define and load a model first')
@@ -404,32 +435,36 @@ class ConvPaintWidget(QWidget):
 
         self.check_prediction_layer_exists()
         
-        if (self.viewer.dims.ndim > 2) & (not self.check_dims_is_channels.isChecked()):
-            step = self.viewer.dims.current_step[0]
-            image = self.viewer.layers[self.selected_channel].data[step]
-            predicted_image = predict_image(
-                image, self.model, self.random_forest, self.param.scalings,
-                order=self.spin_interpolation_order.value(),
-                use_min_features=self.check_use_min_features.isChecked(),
-                device=device, normalize=self.check_normalize.isChecked(),
-                image_downsample=self.spin_downsample.value()
-            )
-            self.viewer.layers['prediction'].data[step] = predicted_image
-        else:
+        self.viewer.window._status_bar._toggle_activity_dock(True)
+        with progress(total=0) as pbr:
+            pbr.set_description(f"Prediction")
+            if (self.viewer.dims.ndim > 2) & (not self.check_dims_is_channels.isChecked()):
+                step = self.viewer.dims.current_step[0]
+                image = self.viewer.layers[self.selected_channel].data[step]
+                predicted_image = predict_image(
+                    image, self.model, self.random_forest, self.param.scalings,
+                    order=self.spin_interpolation_order.value(),
+                    use_min_features=self.check_use_min_features.isChecked(),
+                    device=device, normalize=self.check_normalize.isChecked(),
+                    image_downsample=self.spin_downsample.value()
+                )
+                self.viewer.layers['prediction'].data[step] = predicted_image
+            else:
 
-            data_to_pass = self.viewer.layers[self.selected_channel].data
-            if self.viewer.layers[self.selected_channel].rgb:
-                data_to_pass = np.moveaxis(data_to_pass, 2, 0)
-            predicted_image = predict_image(
-                data_to_pass, self.model, self.random_forest, self.param.scalings,
-                order=self.spin_interpolation_order.value(),
-                use_min_features=self.check_use_min_features.isChecked(),
-                device=device, normalize=self.check_normalize.isChecked(),
-                image_downsample=self.spin_downsample.value()
-            )
-            self.viewer.layers['prediction'].data = predicted_image
-        
-        self.viewer.layers['prediction'].refresh()
+                data_to_pass = self.viewer.layers[self.selected_channel].data
+                if self.viewer.layers[self.selected_channel].rgb:
+                    data_to_pass = np.moveaxis(data_to_pass, 2, 0)
+                predicted_image = predict_image(
+                    data_to_pass, self.model, self.random_forest, self.param.scalings,
+                    order=self.spin_interpolation_order.value(),
+                    use_min_features=self.check_use_min_features.isChecked(),
+                    device=device, normalize=self.check_normalize.isChecked(),
+                    image_downsample=self.spin_downsample.value()
+                )
+                self.viewer.layers['prediction'].data = predicted_image
+            
+            self.viewer.layers['prediction'].refresh()
+        self.viewer.window._status_bar._toggle_activity_dock(False)
 
     def predict_all(self):
         """Predict the segmentation of all frames based 
@@ -439,7 +474,7 @@ class ConvPaintWidget(QWidget):
             raise Exception('No model found. Please train a model first.')
         
         if self.model is None:
-            if self.check_use_default_model.isChecked():
+            if not self.check_use_custom_model.isChecked():
                 self.set_default_model()
             else:
                 raise Exception('You have to define and load a model first')
@@ -448,7 +483,8 @@ class ConvPaintWidget(QWidget):
 
         self.check_prediction_layer_exists()
 
-        for step in range(self.viewer.dims.nsteps[0]):
+        self.viewer.window._status_bar._toggle_activity_dock(True)
+        for step in progress(range(self.viewer.dims.nsteps[0])):
             image = self.viewer.layers[self.selected_channel].data[step]
             predicted_image = predict_image(
                 image, self.model, self.random_forest, self.param.scalings,
@@ -457,6 +493,7 @@ class ConvPaintWidget(QWidget):
                 device=device, normalize=self.check_normalize.isChecked(),
                 image_downsample=self.spin_downsample.value())
             self.viewer.layers['prediction'].data[step] = predicted_image
+        self.viewer.window._status_bar._toggle_activity_dock(False)
 
     def check_prediction_layer_exists(self):
 
